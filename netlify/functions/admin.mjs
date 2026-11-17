@@ -8,6 +8,21 @@ const json = (body, status = 200) => Response.json(body, {
 });
 const uuid = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i;
 
+function databaseFailure(error) {
+  // Return only a safe category to the browser; never expose SQL, hostnames,
+  // credentials, or raw PostgreSQL error messages.
+  if (error?.message === "database_not_configured") {
+    return "DATABASE_URL is missing from this site's Netlify function environment variables.";
+  }
+  if (["42P01", "42703"].includes(error?.code)) {
+    return "Database schema is missing or outdated. Run the current schema.sql against the database configured in DATABASE_URL, then redeploy.";
+  }
+  if (["28P01", "3D000", "ECONNREFUSED", "ENOTFOUND", "ETIMEDOUT"].includes(error?.code)) {
+    return "Netlify cannot connect to the configured database. Check DATABASE_URL, database credentials, and network access.";
+  }
+  return "Admin database request failed. Check DATABASE_URL and apply the current schema.sql.";
+}
+
 export default async function admin(req) {
   const auth = authorizeAdmin(req);
   if (auth !== 200) return json({ error: auth === 503 ? "Admin service is not configured." : "Admin authentication or request check failed." }, auth);
@@ -78,12 +93,14 @@ export default async function admin(req) {
       await client.query("UPDATE admin_audit SET customer_id=$1 WHERE id=$2", [customerId, body.operationId]);
       await client.query("COMMIT");
       return json({ ok: true, customerId, ...(key ? { key, note: "Shown once. Deliver privately; not stored in plaintext." } : {}) });
-    } catch {
+    } catch (error) {
       await client.query("ROLLBACK");
-      throw new Error("operation_failed");
+      throw error;
     } finally { client.release(); }
-  } catch {
-    return json({ error: "Admin operation failed. Check database schema and server configuration. Refresh balances before retrying." }, 503);
+  } catch (error) {
+    // Keep logs useful while excluding raw messages and request/customer data.
+    console.error("Admin database operation failed", { code: error?.code ?? "unknown" });
+    return json({ error: databaseFailure(error) }, 503);
   }
 }
 export const config = { path: "/api/admin" };
